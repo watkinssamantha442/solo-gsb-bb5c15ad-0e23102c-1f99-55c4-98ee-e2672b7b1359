@@ -7,7 +7,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -22,6 +22,16 @@ from .bulk_import import (
     preview_bulk_import,
 )
 from .db import get_conn, init_db
+from .findings import (
+    FindingError,
+    build_queue,
+    dispose_finding,
+    get_finding_detail,
+    normalize_bound,
+    queue_summary,
+    sync_all_findings,
+    sync_sample_findings,
+)
 from .handovers import (
     HandoverError,
     build_handover_view,
@@ -33,6 +43,7 @@ from .report import build_html, build_json, build_markdown
 from .schemas import (
     BulkImportConfirm,
     EventCreate,
+    FindingDispose,
     HandoverConfirm,
     SampleCreate,
     SignoffCreate,
@@ -160,6 +171,8 @@ def add_event(
     )
     # 新事件可能插入到某对相邻事件之间，原确认随之失效（记录保留）
     refresh_handover_validity(conn, sample_id)
+    # 重算审计发现指纹：新异常以未处理入库，消失的转已消除历史
+    sync_sample_findings(conn, sample_id)
     conn.commit()
     row = conn.execute("SELECT * FROM events WHERE id = ?", (cur.lastrowid,)).fetchone()
     return {"id": row["id"], "seq": row["seq"]}
@@ -176,6 +189,8 @@ def update_event(event_id: int, payload: EventCreate, conn: Connection = Depends
     )
     # 绑定该事件关键字段的原确认保留为失效记录，需两侧重新确认
     refresh_handover_validity(conn, row["sample_id"])
+    # 重算审计发现指纹：仍存在的沿用处置状态，新出现的保持未处理
+    sync_sample_findings(conn, row["sample_id"])
     conn.commit()
     return {"id": event_id, "updated": True}
 
@@ -189,6 +204,8 @@ def delete_event(event_id: int, conn: Connection = Depends(get_conn)) -> Respons
     # 删除事件后，绑定它的原确认保留为失效记录（行与快照不删）
     conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
     refresh_handover_validity(conn, sample_id)
+    # 重算审计发现指纹：消失的异常转为已消除历史
+    sync_sample_findings(conn, sample_id)
     conn.commit()
     return Response(status_code=204)
 
@@ -245,6 +262,8 @@ def confirm_events_import(
         conn.execute("BEGIN IMMEDIATE")
         try:
             result = confirm_bulk_import(conn, sample_id, payload.token)
+            # 导入后同事务重算审计发现指纹：新异常未处理、消失的转已消除
+            sync_sample_findings(conn, sample_id)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -307,6 +326,71 @@ def get_handover(handover_id: int, conn: Connection = Depends(get_conn)) -> dict
     try:
         return get_handover_record(conn, handover_id)
     except HandoverError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+# ---------- 异常处置队列（跨样本） ----------
+
+@app.get("/api/findings/summary")
+def findings_summary(conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """未处理 / 已处理 / 已消除数量（先按当前链路重算指纹）。"""
+    sync_all_findings(conn)
+    return queue_summary(conn)
+
+
+@app.get("/api/findings/queue")
+def findings_queue(
+    status: str = Query("open", pattern="^(open|resolved|eliminated|all)$"),
+    code: Optional[str] = Query(None),
+    custodian: Optional[str] = Query(None),
+    time_from: Optional[str] = Query(None),
+    time_to: Optional[str] = Query(None),
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """跨样本异常处置队列：按状态 / 异常类型 / 经手人 / 发生时间筛选。"""
+    try:
+        bound_from = normalize_bound(time_from, "发生时间从")
+        bound_to = normalize_bound(time_to, "发生时间至")
+        return build_queue(
+            conn,
+            status=status,
+            code=(code or "").strip() or None,
+            custodian=custodian,
+            time_from=bound_from,
+            time_to=bound_to,
+        )
+    except FindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/findings/{fingerprint}")
+def finding_detail(fingerprint: str, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """发现详情：当前状态 + 完整状态迁移记录（含系统自动迁移）。"""
+    try:
+        return get_finding_detail(conn, fingerprint)
+    except FindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/findings/{fingerprint}/dispose")
+def finding_dispose(
+    fingerprint: str, payload: FindingDispose, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """处置写入：标记已处理 / 重新打开。
+
+    服务端先按当前链路重算指纹，再校验客户端看到的指纹版本
+    （expected_version）；版本过期返回 409，客户端应刷新队列后重试。
+    """
+    try:
+        return dispose_finding(
+            conn,
+            fingerprint,
+            payload.action,
+            payload.handler,
+            payload.note,
+            payload.expected_version,
+        )
+    except FindingError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 

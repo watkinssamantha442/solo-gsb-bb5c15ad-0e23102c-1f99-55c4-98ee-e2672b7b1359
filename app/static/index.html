@@ -26,6 +26,10 @@
       <div class="sidebar-header">
         <h2>样本列表</h2>
       </div>
+      <button id="btn-queue" class="queue-entry" type="button">
+        <span class="qe-icon">🚨</span> 异常处置队列
+        <span id="queue-badge" class="queue-badge" hidden>0</span>
+      </button>
       <ul id="sample-list" class="sample-list"></ul>
     </aside>
 
@@ -34,6 +38,72 @@
       <div id="empty-state" class="empty-state">
         <div class="empty-icon">📋</div>
         <p>请从左侧选择一个样本，或新建样本开始登记交接事件。</p>
+      </div>
+
+      <!-- 异常处置队列（跨样本视图） -->
+      <div id="queue-view" class="detail" hidden>
+        <section class="card">
+          <div class="card-head">
+            <h3>异常处置队列</h3>
+            <span class="head-hint">跨样本汇总审计发现；身份按「样本 + 关联事件 + 异常类型 + 时间边界」稳定指纹跟踪，链路编辑后自动重算</span>
+          </div>
+          <div id="queue-stats" class="handover-stats"></div>
+          <form id="queue-filter-form" class="event-form">
+            <div class="form-grid form-grid-queue">
+              <label>异常类型
+                <select id="q-code">
+                  <option value="">全部类型</option>
+                  <option value="gap">断档</option>
+                  <option value="overlap">重叠</option>
+                  <option value="reversed_interval">起止倒置</option>
+                  <option value="out_of_order">逆序录入</option>
+                  <option value="bad_time">时间错误</option>
+                </select>
+              </label>
+              <label>经手人
+                <input type="text" id="q-custodian" list="q-custodian-list" maxlength="64" placeholder="模糊匹配，如：李四" />
+                <datalist id="q-custodian-list"></datalist>
+              </label>
+              <label>发生时间从
+                <input type="datetime-local" id="q-from" step="1" />
+              </label>
+              <label>发生时间至
+                <input type="datetime-local" id="q-to" step="1" />
+              </label>
+              <label>状态
+                <select id="q-status">
+                  <option value="open" selected>未处理</option>
+                  <option value="resolved">已处理</option>
+                  <option value="eliminated">已消除（历史）</option>
+                  <option value="all">全部</option>
+                </select>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">筛选</button>
+              <button type="button" id="btn-queue-reset" class="btn btn-ghost">重置</button>
+              <button type="button" id="btn-queue-refresh" class="btn btn-ghost">↻ 刷新</button>
+              <span id="queue-synced" class="head-hint queue-synced"></span>
+            </div>
+          </form>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead>
+                <tr>
+                  <th>样本</th>
+                  <th>异常类型</th>
+                  <th>发现内容</th>
+                  <th>关联经手人</th>
+                  <th>发生时间</th>
+                  <th>状态</th>
+                  <th>处置信息</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="queue-tbody"></tbody>
+            </table>
+          </div>
+        </section>
       </div>
 
       <div id="detail" class="detail" hidden>
@@ -339,6 +409,37 @@
           确认导入
         </button>
         <button type="button" class="btn btn-ghost" id="btn-close-import">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 异常处置弹窗 -->
+  <div id="dispose-modal" class="modal-mask" hidden>
+    <div class="modal">
+      <h3 id="dispose-title">处置审计发现</h3>
+      <div id="dispose-body" class="dispose-body"></div>
+      <form id="dispose-form">
+        <label>处置人
+          <input type="text" id="dp-handler" maxlength="64" placeholder="如：审计员 王敏" required />
+        </label>
+        <label>备注
+          <input type="text" id="dp-note" maxlength="512" placeholder="可选，如：已联系当事人补齐交接手续" />
+        </label>
+        <div class="form-actions">
+          <button type="submit" id="dp-submit" class="btn btn-primary">标记已处理</button>
+          <button type="button" id="btn-close-dispose" class="btn btn-ghost">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 发现状态迁移记录弹窗 -->
+  <div id="finding-history-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <h3>状态迁移记录</h3>
+      <div id="finding-history-body" class="signoff-detail"></div>
+      <div class="form-actions">
+        <button type="button" id="btn-close-finding-history" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

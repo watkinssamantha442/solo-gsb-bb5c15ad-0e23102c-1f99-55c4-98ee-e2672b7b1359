@@ -145,3 +145,29 @@ class HandoverConfirm(BaseModel):
         if normalized is None:
             raise ValueError("确认时间不能为空")
         return normalized
+
+
+class FindingDispose(BaseModel):
+    """异常处置：标记已处理 / 重新打开。
+
+    必须携带客户端看到的指纹版本号 ``expected_version``（乐观锁）；
+    版本过期时服务端返回 409，客户端应刷新队列后重试。
+    """
+
+    action: str = Field(..., pattern="^(resolve|reopen)$")
+    expected_version: int = Field(..., ge=1)
+    handler: str = Field(..., min_length=1, max_length=64)
+    note: str = Field("", max_length=512)
+
+    @field_validator("handler")
+    @classmethod
+    def _strip_handler(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("处置人不能为空")
+        return v
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()

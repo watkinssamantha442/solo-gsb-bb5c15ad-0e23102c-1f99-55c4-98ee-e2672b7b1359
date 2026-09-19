@@ -110,6 +110,49 @@ CREATE TABLE IF NOT EXISTS handovers (
 CREATE INDEX IF NOT EXISTS idx_handovers_sample ON handovers(sample_id);
 CREATE INDEX IF NOT EXISTS idx_handovers_pair
     ON handovers(from_event_id, to_event_id);
+
+-- 异常处置队列：跨样本的审计发现处置状态。发现身份为 SHA-256 稳定指纹
+-- （样本 + 关联事件 + 异常类型 + 时间边界），与列表顺序无关；
+-- 链路变更后重算：仍存在沿用状态、消失转已消除、新出现未处理。
+-- version 为乐观锁：处置写入必须携带客户端看到的版本，过期返回 409。
+CREATE TABLE IF NOT EXISTS findings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint   TEXT    NOT NULL UNIQUE,
+    sample_id     INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    code          TEXT    NOT NULL,
+    kind          TEXT    NOT NULL,
+    message       TEXT    NOT NULL,
+    event_ids     TEXT    NOT NULL DEFAULT '[]',
+    custodians    TEXT    NOT NULL DEFAULT '[]',
+    time_from     TEXT,
+    time_to       TEXT,
+    status        TEXT    NOT NULL DEFAULT 'open',
+    handler       TEXT,
+    note          TEXT    NOT NULL DEFAULT '',
+    version       INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT    NOT NULL,
+    last_seen_at  TEXT    NOT NULL,
+    resolved_at   TEXT,
+    eliminated_at TEXT,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_sample ON findings(sample_id);
+CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+
+-- 状态迁移记录：首次出现、人工处置与系统自动迁移（消除 / 复现）全部留痕
+CREATE TABLE IF NOT EXISTS finding_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id  INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    from_status TEXT,
+    to_status   TEXT    NOT NULL,
+    handler     TEXT,
+    note        TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ftrans_finding ON finding_transitions(finding_id);
 """
 
 

@@ -11,6 +11,12 @@
     editingId: null,
     viewSignoffId: null, // 当前弹窗中查看的签署快照 id
     confirmPair: null,   // 当前确认弹窗对应的交接项 { fromId, toId }
+    view: "sample",      // 主区域当前视图：sample（样本详情）| queue（异常处置队列）
+    queue: {
+      filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "" },
+      data: null,        // 最近一次队列响应
+      dispose: null,     // 当前处置弹窗目标 { fp, version, action }
+    },
   };
 
   // ---------- 工具 ----------
@@ -37,7 +43,9 @@
       /* 非 JSON 响应 */
     }
     if (!resp.ok) {
-      throw new Error(extractError(payload) || `请求失败（${resp.status}）`);
+      const err = new Error(extractError(payload) || `请求失败（${resp.status}）`);
+      err.status = resp.status;
+      throw err;
     }
     return payload;
   }
@@ -85,6 +93,7 @@
     event_deleted: "关联事件已被删除",
     adjacency_changed: "两条记录不再相邻",
   };
+  const FINDING_STATUS_LABEL = { open: "未处理", resolved: "已处理", eliminated: "已消除" };
 
   // ---------- 样本列表 ----------
 
@@ -110,6 +119,21 @@
       state.currentId = null;
       showEmpty();
     }
+    loadQueueBadge(); // 未处理数角标随样本 / 链路变化刷新
+  }
+
+  // 主区域视图切换：样本详情 <-> 异常处置队列（跨样本）
+  function setView(view) {
+    state.view = view;
+    $("#btn-queue").classList.toggle("active", view === "queue");
+    $("#queue-view").hidden = view !== "queue";
+    if (view === "queue") {
+      $("#detail").hidden = true;
+      $("#empty-state").hidden = true;
+      document
+        .querySelectorAll("#sample-list li")
+        .forEach((li) => li.classList.remove("active"));
+    }
   }
 
   $("#sample-list").addEventListener("click", (e) => {
@@ -118,6 +142,7 @@
   });
 
   function showEmpty() {
+    setView("sample");
     $("#detail").hidden = true;
     $("#empty-state").hidden = false;
   }
@@ -127,6 +152,7 @@
       state.currentId = id;
       state.data = await api(`/api/samples/${id}`);
       state.editingId = null;
+      setView("sample");
       renderAll();
       $("#empty-state").hidden = true;
       $("#detail").hidden = false;
@@ -535,6 +561,276 @@
   $("#btn-close-handover-detail").addEventListener("click", () => (handoverDetailModal.hidden = true));
   handoverDetailModal.addEventListener("click", (e) => {
     if (e.target === handoverDetailModal) handoverDetailModal.hidden = true;
+  });
+
+  // ---------- 异常处置队列（跨样本） ----------
+
+  async function loadQueueBadge() {
+    try {
+      const s = await api("/api/findings/summary");
+      updateQueueBadge(s);
+    } catch (_) {
+      /* 角标刷新失败不阻塞主流程 */
+    }
+  }
+
+  function updateQueueBadge(summary) {
+    const badge = $("#queue-badge");
+    const n = (summary && summary.open) || 0;
+    badge.textContent = n > 99 ? "99+" : String(n);
+    badge.hidden = n === 0;
+  }
+
+  $("#btn-queue").addEventListener("click", () => {
+    setView("queue");
+    loadQueue();
+  });
+
+  async function loadQueue() {
+    const f = state.queue.filters;
+    const params = new URLSearchParams();
+    params.set("status", f.status);
+    if (f.code) params.set("code", f.code);
+    if (f.custodian) params.set("custodian", f.custodian);
+    if (f.time_from) params.set("time_from", f.time_from);
+    if (f.time_to) params.set("time_to", f.time_to);
+    try {
+      const data = await api(`/api/findings/queue?${params.toString()}`);
+      state.queue.data = data;
+      renderQueue();
+      updateQueueBadge(data.summary);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  function renderQueue() {
+    const data = state.queue.data;
+    if (!data) return;
+    const s = data.summary || {};
+    $("#queue-stats").innerHTML = [
+      statChip(s.open ?? 0, "未处理", s.open ? "bad" : ""),
+      statChip(s.resolved ?? 0, "已处理", "ok"),
+      statChip(s.eliminated ?? 0, "已消除", "muted"),
+      statChip(s.total ?? 0, "累计发现", ""),
+    ].join("");
+    $("#queue-synced").textContent = data.synced_at
+      ? `已按当前链路重算 · ${data.synced_at}`
+      : "";
+
+    // 经手人候选（跨样本去重，由服务端返回）
+    $("#q-custodian-list").innerHTML = (data.custodians || [])
+      .map((c) => `<option value="${esc(c)}"></option>`)
+      .join("");
+
+    const tbody = $("#queue-tbody");
+    if (!data.items.length) {
+      tbody.innerHTML = `<tr><td colspan="8" class="muted-cell" style="text-align:center;padding:22px">当前筛选条件下没有审计发现</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = data.items.map(renderQueueRow).join("");
+  }
+
+  function renderQueueRow(it) {
+    const statusBadge =
+      it.status === "open"
+        ? `<span class="badge badge-fail">未处理</span>`
+        : it.status === "resolved"
+        ? `<span class="badge badge-pass">已处理</span>`
+        : `<span class="badge badge-empty">已消除</span>`;
+    const timeRange = `${esc(it.time_from || "—")}<div class="muted-cell">至 ${esc(
+      it.time_to || "开放（仍在保管）"
+    )}</div>`;
+    const disposeInfo =
+      it.status === "eliminated"
+        ? `<span class="muted-cell">链路变更后消除</span><div class="muted-cell">${esc(
+            it.eliminated_at || ""
+          )}</div>`
+        : it.handler
+        ? `${esc(it.handler)}${
+            it.note ? `<div class="muted-cell">${esc(it.note)}</div>` : ""
+          }<div class="muted-cell">${esc(it.resolved_at || it.updated_at || "")}</div>`
+        : `<span class="muted-cell">—</span>`;
+    const actions = [];
+    if (it.status === "open") {
+      actions.push(
+        `<button class="link-btn btn-edit" data-dispose="resolve" data-fp="${it.fingerprint}" data-ver="${it.version}">处置</button>`
+      );
+    } else if (it.status === "resolved") {
+      actions.push(
+        `<button class="link-btn btn-edit" data-dispose="reopen" data-fp="${it.fingerprint}" data-ver="${it.version}">重新打开</button>`
+      );
+    }
+    actions.push(
+      `<button class="link-btn btn-edit" data-history="${it.fingerprint}">迁移记录</button>`
+    );
+    const rowCls =
+      it.status === "open" ? "row-conflict" : it.status === "eliminated" ? "row-invalid" : "";
+    return `
+      <tr class="${rowCls}">
+        <td><div class="s-code">${esc(it.sample.code)}</div><div class="muted-cell">${esc(it.sample.name)}</div></td>
+        <td><span class="finding-tag finding-tag-${esc(it.code)}">${esc(FINDING_LABEL[it.code] || it.code)}</span></td>
+        <td>${esc(it.message)}<div class="muted-cell">指纹 <code class="digest">${esc(
+          it.fingerprint.slice(0, 12)
+        )}</code> · v${it.version}</div></td>
+        <td>${it.custodians.map(esc).join("、") || "—"}</td>
+        <td>${timeRange}</td>
+        <td>${statusBadge}<div class="muted-cell">首次 ${esc(it.first_seen_at)}</div></td>
+        <td>${disposeInfo}</td>
+        <td style="white-space:nowrap">${actions.join("")}</td>
+      </tr>`;
+  }
+
+  // 筛选表单
+  $("#queue-filter-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    state.queue.filters = {
+      status: $("#q-status").value,
+      code: $("#q-code").value,
+      custodian: $("#q-custodian").value.trim(),
+      time_from: $("#q-from").value,
+      time_to: $("#q-to").value,
+    };
+    loadQueue();
+  });
+  $("#btn-queue-reset").addEventListener("click", () => {
+    $("#queue-filter-form").reset();
+    $("#q-status").value = "open";
+    state.queue.filters = { status: "open", code: "", custodian: "", time_from: "", time_to: "" };
+    loadQueue();
+  });
+  $("#btn-queue-refresh").addEventListener("click", loadQueue);
+
+  // 队列行操作：处置 / 重新打开 / 迁移记录
+  $("#queue-tbody").addEventListener("click", (e) => {
+    const disposeBtn = e.target.closest("button[data-dispose]");
+    if (disposeBtn) {
+      openDisposeModal(
+        disposeBtn.dataset.fp,
+        Number(disposeBtn.dataset.ver),
+        disposeBtn.dataset.dispose
+      );
+      return;
+    }
+    const histBtn = e.target.closest("button[data-history]");
+    if (histBtn) openFindingHistory(histBtn.dataset.history);
+  });
+
+  function openDisposeModal(fp, version, action) {
+    const items = (state.queue.data && state.queue.data.items) || [];
+    const it = items.find((x) => x.fingerprint === fp);
+    if (!it) return;
+    state.queue.dispose = { fp, version, action };
+    $("#dispose-title").textContent =
+      action === "resolve" ? "处置审计发现（标记已处理）" : "重新打开审计发现";
+    $("#dispose-body").innerHTML = `
+      <div class="dispose-finding">
+        <div><span class="meta-lbl">样本</span>${esc(it.sample.code)} · ${esc(it.sample.name)}</div>
+        <div><span class="meta-lbl">类型</span>${esc(FINDING_LABEL[it.code] || it.code)}</div>
+        <div><span class="meta-lbl">发现</span>${esc(it.message)}</div>
+        <div><span class="meta-lbl">指纹版本</span><code class="digest">${esc(
+          it.fingerprint.slice(0, 12)
+        )}</code> · v${it.version}</div>
+      </div>
+      <p class="muted-cell ho-modal-hint">提交时服务端将校验该指纹版本；若期间链路或状态已变化，将返回冲突并自动刷新队列。</p>`;
+    $("#dp-submit").textContent = action === "resolve" ? "标记已处理" : "重新打开";
+    $("#dispose-form").reset();
+    $("#dispose-modal").hidden = false;
+    $("#dp-handler").focus();
+  }
+
+  const disposeModal = $("#dispose-modal");
+  $("#btn-close-dispose").addEventListener("click", () => (disposeModal.hidden = true));
+  disposeModal.addEventListener("click", (e) => {
+    if (e.target === disposeModal) disposeModal.hidden = true;
+  });
+
+  $("#dispose-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const d = state.queue.dispose;
+    if (!d) return;
+    const payload = {
+      action: d.action,
+      expected_version: d.version,
+      handler: $("#dp-handler").value.trim(),
+      note: $("#dp-note").value.trim(),
+    };
+    if (!payload.handler) {
+      toast("请填写处置人", true);
+      return;
+    }
+    try {
+      await api(`/api/findings/${d.fp}/dispose`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      disposeModal.hidden = true;
+      state.queue.dispose = null;
+      toast(d.action === "resolve" ? "已标记为已处理" : "已重新打开，恢复为未处理");
+      await loadQueue();
+    } catch (err) {
+      // 指纹版本过期 / 状态冲突：提示并刷新队列（过期请求返回冲突并刷新）
+      if (err.status === 409 || err.status === 404) {
+        disposeModal.hidden = true;
+        state.queue.dispose = null;
+        await loadQueue();
+        toast(err.message, true);
+      } else {
+        toast(err.message, true);
+      }
+    }
+  });
+
+  // 状态迁移记录
+  async function openFindingHistory(fp) {
+    try {
+      const d = await api(`/api/findings/${fp}`);
+      const rows = (d.transitions || [])
+        .map((t) => {
+          const move = t.from_status
+            ? `${FINDING_STATUS_LABEL[t.from_status] || t.from_status} → ${
+                FINDING_STATUS_LABEL[t.to_status] || t.to_status
+              }`
+            : `首次出现（${FINDING_STATUS_LABEL[t.to_status] || t.to_status}）`;
+          return `<tr>
+            <td>${esc(t.created_at)}</td>
+            <td>${esc(move)}</td>
+            <td>${t.handler ? esc(t.handler) : '<span class="muted-cell">系统</span>'}</td>
+            <td>${esc(t.note || "—")}</td>
+          </tr>`;
+        })
+        .join("");
+      $("#finding-history-body").innerHTML = `
+        <div class="signoff-meta">
+          <div><span class="meta-lbl">样本</span>${esc(d.sample.code)} · ${esc(d.sample.name)}</div>
+          <div><span class="meta-lbl">异常类型</span>${esc(FINDING_LABEL[d.code] || d.code)}</div>
+          <div><span class="meta-lbl">当前状态</span>${esc(
+            FINDING_STATUS_LABEL[d.status] || d.status
+          )}（v${d.version}）</div>
+          <div><span class="meta-lbl">稳定指纹</span><code class="digest">${esc(d.fingerprint)}</code></div>
+          <div><span class="meta-lbl">首次出现</span>${esc(d.first_seen_at)}</div>
+          <div><span class="meta-lbl">最近出现</span>${esc(d.last_seen_at)}</div>
+        </div>
+        <p class="conclusion">${esc(d.message)}</p>
+        <div class="table-wrap">
+          <table class="event-table">
+            <thead><tr><th>时间</th><th>状态迁移</th><th>操作人</th><th>备注</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+      $("#finding-history-modal").hidden = false;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  const findingHistoryModal = $("#finding-history-modal");
+  $("#btn-close-finding-history").addEventListener(
+    "click",
+    () => (findingHistoryModal.hidden = true)
+  );
+  findingHistoryModal.addEventListener("click", (e) => {
+    if (e.target === findingHistoryModal) findingHistoryModal.hidden = true;
   });
 
   // ---------- 事件增 / 改 / 删 ----------
