@@ -7,7 +7,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -22,6 +22,16 @@ from .bulk_import import (
     preview_bulk_import,
 )
 from .db import get_conn, init_db
+from .findings import (
+    FindingError,
+    ACTION_REOPENED,
+    ACTION_RESOLVED,
+    apply_disposition,
+    build_findings_queue,
+    list_transitions,
+    reconcile_findings,
+    sample_findings_summary,
+)
 from .handovers import (
     HandoverError,
     build_handover_view,
@@ -33,6 +43,7 @@ from .report import build_html, build_json, build_markdown
 from .schemas import (
     BulkImportConfirm,
     EventCreate,
+    FindingDispositionAction,
     HandoverConfirm,
     SampleCreate,
     SignoffCreate,
@@ -125,6 +136,8 @@ def create_sample(payload: SampleCreate, conn: Connection = Depends(get_conn)) -
 def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
     sample = _fetch_sample(conn, sample_id)
     events = _fetch_events(conn, sample_id)
+    # 防御性对账：保证详情页的处置计数与当前链路一致
+    reconcile_findings(conn, sample_id)
     audit = build_audit(events)
     return {
         "sample": sample,
@@ -132,6 +145,7 @@ def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str
         "audit": audit,
         "signoffs": _list_signoffs(conn, sample_id),
         "handovers": build_handover_view(conn, sample_id),
+        "findings_summary": sample_findings_summary(conn, sample_id),
     }
 
 
@@ -160,6 +174,8 @@ def add_event(
     )
     # 新事件可能插入到某对相邻事件之间，原确认随之失效（记录保留）
     refresh_handover_validity(conn, sample_id)
+    # 按稳定指纹对账发现：仍在的沿用处置状态，新出现的建档，消失的转已消除
+    reconcile_findings(conn, sample_id)
     conn.commit()
     row = conn.execute("SELECT * FROM events WHERE id = ?", (cur.lastrowid,)).fetchone()
     return {"id": row["id"], "seq": row["seq"]}
@@ -176,6 +192,8 @@ def update_event(event_id: int, payload: EventCreate, conn: Connection = Depends
     )
     # 绑定该事件关键字段的原确认保留为失效记录，需两侧重新确认
     refresh_handover_validity(conn, row["sample_id"])
+    # 链路编辑后重算发现指纹：处置状态沿用 / 消除 / 重新建档
+    reconcile_findings(conn, row["sample_id"])
     conn.commit()
     return {"id": event_id, "updated": True}
 
@@ -189,6 +207,8 @@ def delete_event(event_id: int, conn: Connection = Depends(get_conn)) -> Respons
     # 删除事件后，绑定它的原确认保留为失效记录（行与快照不删）
     conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
     refresh_handover_validity(conn, sample_id)
+    # 关联消失的发现指纹转为已消除历史；仍存在的发现沿用处置状态
+    reconcile_findings(conn, sample_id)
     conn.commit()
     return Response(status_code=204)
 
@@ -308,6 +328,108 @@ def get_handover(handover_id: int, conn: Connection = Depends(get_conn)) -> dict
         return get_handover_record(conn, handover_id)
     except HandoverError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+# ---------- 异常处置队列（跨样本） ----------
+
+def _norm_filter_time(value: Optional[str], field_name: str) -> Optional[str]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = text.replace("T", " ")
+    if len(text) == 16:
+        text += ":00"
+    try:
+        datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail=f"{field_name} 格式应为 YYYY-MM-DD HH:MM:SS"
+        )
+    return text
+
+
+@app.get("/api/findings/queue")
+def findings_queue(
+    status: Optional[str] = Query(
+        "open", pattern="^(open|resolved|eliminated|all)$"
+    ),
+    code: Optional[str] = Query(
+        None,
+        pattern="^(gap|overlap|reversed_interval|out_of_order|bad_time)$",
+    ),
+    custodian: Optional[str] = Query(None, max_length=64),
+    occurred_from: Optional[str] = None,
+    occurred_to: Optional[str] = None,
+    sample_id: Optional[int] = None,
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """跨样本异常处置队列：按异常类型、经手人、发生时间筛选，返回处置行 + 未处理计数。"""
+    if sample_id is not None:
+        _fetch_sample(conn, sample_id)
+    filters = {
+        "status": None if status == "all" else status,
+        "finding_code": code.strip() if code and code.strip() else None,
+        "custodian": custodian.strip() if custodian and custodian.strip() else None,
+        "occurred_from": _norm_filter_time(occurred_from, "发生时间起点"),
+        "occurred_to": _norm_filter_time(occurred_to, "发生时间终点"),
+        "sample_id": sample_id,
+    }
+    return build_findings_queue(conn, reconcile=True, **filters)
+
+
+@app.post("/api/findings/{fingerprint}/disposition")
+def disposition_finding(
+    fingerprint: str,
+    payload: FindingDispositionAction,
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """标记已处理 / 重新打开；校验客户端看到的指纹版本，过期返回 409 并携带最新视图。"""
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint or ""):
+        raise HTTPException(status_code=404, detail="异常发现不存在")
+    action = ACTION_RESOLVED if payload.action == "resolve" else ACTION_REOPENED
+    try:
+        item = apply_disposition(
+            conn,
+            fingerprint=fingerprint,
+            action=action,
+            handler_name=payload.handler_name,
+            handler_note=payload.handler_note,
+            expected_version=payload.expected_version,
+        )
+    except FindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    conn.commit()
+    counts = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM finding_dispositions GROUP BY status"
+    ).fetchall()
+    summary = {"open": 0, "resolved": 0, "eliminated": 0, "total": 0}
+    for r in counts:
+        summary[r["status"]] = r["n"]
+    summary["total"] = summary["open"] + summary["resolved"] + summary["eliminated"]
+    return {"item": item, "summary": summary}
+
+
+@app.get("/api/findings/transitions")
+def findings_transitions(
+    sample_id: Optional[int] = None,
+    fingerprint: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """状态迁移记录（默认全局最新 200 条；可按样本或单条指纹过滤）。"""
+    items = list_transitions(
+        conn, sample_id=sample_id, fingerprint=(fingerprint or None), limit=limit
+    )
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/findings/queue/open-count")
+def findings_open_count(conn: Connection = Depends(get_conn)) -> dict[str, int]:
+    """未处理数（侧栏角标用，轻量；读取前逐样本防御性对账）。"""
+    queue = build_findings_queue(conn, reconcile=True)
+    return queue["summary"]
 
 
 # ---------- 结论签署（不可变快照） ----------

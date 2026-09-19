@@ -503,6 +503,12 @@ def confirm_bulk_import(
     # 新增事件可能插入到相邻事件之间，原确认随之失效（记录保留）
     refresh_handover_validity(conn, sample_id)
 
+    # 同一事务内按稳定指纹对账异常发现（新增 / 沿用 / 消除），
+    # 失败随事务整体回滚，绝不部分落库
+    from .findings import reconcile_findings
+
+    reconcile_findings(conn, sample_id)
+
     reason_counts: dict[str, int] = {}
     if before_active_ids:
         placeholders = ",".join("?" * len(before_active_ids))

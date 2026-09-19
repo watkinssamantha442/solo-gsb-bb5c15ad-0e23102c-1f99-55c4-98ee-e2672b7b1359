@@ -21,12 +21,63 @@
   </header>
 
   <div class="layout">
-    <!-- 左侧样本列表 -->
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <h2>样本列表</h2>
+    <!-- 左侧：样本列表 / 异常处置队列 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-tabs">
+        <button id="tab-samples" class="sidebar-tab active" type="button">样本列表</button>
+        <button id="tab-findings" class="sidebar-tab" type="button">
+          异常处置队列<span id="findings-badge" class="queue-badge" hidden>0</span>
+        </button>
       </div>
-      <ul id="sample-list" class="sample-list"></ul>
+
+      <div id="sidebar-samples" class="sidebar-pane">
+        <ul id="sample-list" class="sample-list"></ul>
+      </div>
+
+      <div id="sidebar-findings" class="sidebar-pane" hidden>
+        <div class="queue-filters">
+          <div class="queue-summary" id="queue-summary"></div>
+          <div class="queue-filter-row">
+            <label>状态
+              <select id="qf-status">
+                <option value="open">未处理</option>
+                <option value="resolved">已处理</option>
+                <option value="eliminated">已消除</option>
+                <option value="all">全部</option>
+              </select>
+            </label>
+            <label>异常类型
+              <select id="qf-code">
+                <option value="">全部类型</option>
+                <option value="gap">保管断档</option>
+                <option value="overlap">交接重叠</option>
+                <option value="reversed_interval">起止倒置</option>
+                <option value="out_of_order">逆序录入</option>
+                <option value="bad_time">时间错误</option>
+              </select>
+            </label>
+          </div>
+          <div class="queue-filter-row">
+            <label class="qf-custodian">经手人
+              <input type="text" id="qf-custodian" maxlength="64" placeholder="姓名关键字" />
+            </label>
+          </div>
+          <div class="queue-filter-row">
+            <label>发生时间 起
+              <input type="datetime-local" id="qf-from" step="1" />
+            </label>
+            <label>止
+              <input type="datetime-local" id="qf-to" step="1" />
+            </label>
+          </div>
+          <div class="queue-filter-actions">
+            <button type="button" id="btn-qf-apply" class="btn btn-small btn-primary">筛选</button>
+            <button type="button" id="btn-qf-reset" class="btn btn-small btn-ghost">重置</button>
+            <button type="button" id="btn-qf-transitions" class="btn btn-small btn-ghost">迁移记录</button>
+          </div>
+        </div>
+        <div id="queue-list" class="queue-list"></div>
+      </div>
     </aside>
 
     <!-- 主区域 -->
@@ -55,7 +106,12 @@
         <section class="card">
           <div class="card-head">
             <h3>审计结论</h3>
-            <span id="audit-badge" class="badge"></span>
+            <span class="audit-head-right">
+              <button id="btn-goto-queue" class="btn btn-small" type="button">
+                🧯 异常处置队列<span id="sample-open-badge" class="queue-badge queue-badge-inline" hidden>0</span>
+              </button>
+              <span id="audit-badge" class="badge"></span>
+            </span>
           </div>
           <p id="audit-conclusion" class="conclusion"></p>
           <div id="audit-stats" class="stats"></div>
@@ -339,6 +395,34 @@
           确认导入
         </button>
         <button type="button" class="btn btn-ghost" id="btn-close-import">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 异常发现状态迁移记录弹窗 -->
+  <div id="transitions-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <div class="card-head">
+        <h3 id="transitions-title">状态迁移记录</h3>
+        <span class="head-hint">每条发现的建档 / 已处理 / 重新打开 / 已消除 / 再次出现均在此留痕</span>
+      </div>
+      <div class="table-wrap">
+        <table class="event-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>样本</th>
+              <th>类型</th>
+              <th>迁移</th>
+              <th>操作人</th>
+              <th>备注 / 发现摘要</th>
+            </tr>
+          </thead>
+          <tbody id="transitions-tbody"></tbody>
+        </table>
+      </div>
+      <div class="form-actions">
+        <button type="button" id="btn-close-transitions" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

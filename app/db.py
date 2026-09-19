@@ -110,6 +110,51 @@ CREATE TABLE IF NOT EXISTS handovers (
 CREATE INDEX IF NOT EXISTS idx_handovers_sample ON handovers(sample_id);
 CREATE INDEX IF NOT EXISTS idx_handovers_pair
     ON handovers(from_event_id, to_event_id);
+
+-- 异常处置队列：发现身份为稳定指纹（样本 + 关联事件 + 异常类型 + 时间边界），
+-- 链路编辑后由应用层对账（仍在 -> 沿用状态；消失 -> eliminated；新出现 -> open）。
+-- 绝不按数组序号绑定。version 为乐观锁版本，处置写入必须携带看到的版本。
+CREATE TABLE IF NOT EXISTS finding_dispositions (
+    fingerprint     TEXT PRIMARY KEY,
+    sample_id       INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    finding_code    TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'open',
+    event_ids       TEXT    NOT NULL DEFAULT '[]',
+    time_from       TEXT,
+    time_to         TEXT,
+    occurred_at     TEXT    NOT NULL DEFAULT '',
+    custodians      TEXT    NOT NULL DEFAULT '[]',
+    message         TEXT    NOT NULL DEFAULT '',
+    snapshot        TEXT    NOT NULL,
+    handler_name    TEXT,
+    handler_note    TEXT    NOT NULL DEFAULT '',
+    resolved_at     TEXT,
+    eliminated_at   TEXT,
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_sample ON finding_dispositions(sample_id);
+CREATE INDEX IF NOT EXISTS idx_findings_status ON finding_dispositions(status);
+CREATE INDEX IF NOT EXISTS idx_findings_occurred ON finding_dispositions(occurred_at);
+
+-- 发现状态迁移记录：建档 / 已处理 / 重新打开 / 已消除 / 再次出现均留痕。
+-- 指纹行被级联删除时迁移记录一并清除（与样本同生命周期）。
+CREATE TABLE IF NOT EXISTS finding_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT    NOT NULL REFERENCES finding_dispositions(fingerprint) ON DELETE CASCADE,
+    sample_id   INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    action      TEXT    NOT NULL,
+    actor       TEXT    NOT NULL,
+    note        TEXT    NOT NULL DEFAULT '',
+    from_status TEXT,
+    to_status   TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_finding_trans_fp ON finding_transitions(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_finding_trans_sample ON finding_transitions(sample_id);
 """
 
 
@@ -178,6 +223,47 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
         event_ids2.append(ins.lastrowid)
 
     _seed_handovers(conn, sid, event_ids, rows, sid2, event_ids2, rows2, now)
+    _seed_findings(conn, sid, t, now)
+
+
+def _seed_findings(
+    conn: sqlite3.Connection,
+    sid: int,
+    t,
+    now: str,
+) -> None:
+    """预置异常处置队列：建出全部当前发现的处置行，并演示一条已处理记录。"""
+    from .findings import (
+        ACTION_RESOLVED,
+        apply_disposition,
+        extract_current_findings,
+        reconcile_findings,
+    )
+
+    reconcile_findings(conn, sid, now=now)
+
+    # 演示链路中李四（11:30 归还）-> 王五（13:10 接手）有 1 小时 40 分断档，
+    # 预置为「已处理」：其余断档 / 重叠 / 逆序发现保持未处理，开箱即可体验队列。
+    findings = extract_current_findings(conn, sid)
+    boundary_from = t(2, 30)  # 李四的结束时间即断档窗口起点
+    target = next(
+        (
+            fp
+            for fp, desc in findings.items()
+            if desc["code"] == "gap" and desc["from"] == boundary_from
+        ),
+        None,
+    )
+    if target is not None:
+        apply_disposition(
+            conn,
+            fingerprint=target,
+            action=ACTION_RESOLVED,
+            handler_name="审计员 王敏",
+            handler_note="已核实为午间转运空档，交接手续补齐并归档",
+            expected_version=1,
+            acted_at=now,
+        )
 
 
 def _seed_handovers(

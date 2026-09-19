@@ -7,10 +7,14 @@
   const state = {
     samples: [],
     currentId: null,
-    data: null, // { sample, events, audit, signoffs, handovers }
+    data: null, // { sample, events, audit, signoffs, handovers, findings_summary }
     editingId: null,
     viewSignoffId: null, // 当前弹窗中查看的签署快照 id
     confirmPair: null,   // 当前确认弹窗对应的交接项 { fromId, toId }
+    sidebarTab: "samples", // samples | findings
+    queue: null,         // { items, summary, filters }
+    queueForm: null,     // 当前展开处置表单的发现指纹
+    queueSampleFilter: null, // 从样本详情跳入时携带的样本过滤
   };
 
   // ---------- 工具 ----------
@@ -148,6 +152,7 @@
     renderEvents();
     renderSignoffs();
     resetForm();
+    refreshFindingsBadge();
   }
 
   function renderSample() {
@@ -617,7 +622,291 @@
       state.data = await api(`/api/samples/${state.currentId}`);
       renderAll();
     }
+    await refreshFindingsBadge();
   }
+
+  // ---------- 异常处置队列（跨样本） ----------
+
+  const QUEUE_STATUS_LABEL = { open: "未处理", resolved: "已处理", eliminated: "已消除" };
+
+  function queueQueryParams(filters) {
+    const p = new URLSearchParams();
+    p.set("status", filters.status || "open");
+    if (filters.finding_code) p.set("code", filters.finding_code);
+    if (filters.custodian) p.set("custodian", filters.custodian);
+    if (filters.occurred_from) p.set("occurred_from", filters.occurred_from);
+    if (filters.occurred_to) p.set("occurred_to", filters.occurred_to);
+    if (filters.sample_id != null) p.set("sample_id", filters.sample_id);
+    return p.toString();
+  }
+
+  function readQueueFilters() {
+    return {
+      status: $("#qf-status").value,
+      finding_code: $("#qf-code").value,
+      custodian: $("#qf-custodian").value.trim(),
+      occurred_from: $("#qf-from").value ? $("#qf-from").value.replace("T", " ") : "",
+      occurred_to: $("#qf-to").value ? $("#qf-to").value.replace("T", " ") : "",
+      sample_id: state.queueSampleFilter ?? null,
+    };
+  }
+
+  async function loadQueue() {
+    const filters = readQueueFilters();
+    try {
+      state.queue = await api(`/api/findings/queue?${queueQueryParams(filters)}`);
+      renderQueue();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  async function refreshFindingsBadge() {
+    try {
+      const summary = state.queue
+        ? state.queue.summary
+        : (await api("/api/findings/queue/open-count"));
+      const open = summary.open || 0;
+      const badge = $("#findings-badge");
+      badge.textContent = String(open);
+      badge.hidden = open === 0;
+
+      const sBadge = $("#sample-open-badge");
+      const sampleOpen = state.data?.findings_summary?.open ?? 0;
+      sBadge.textContent = String(sampleOpen);
+      sBadge.hidden = sampleOpen === 0;
+    } catch (_) {
+      /* 角标刷新失败不阻塞主流程 */
+    }
+  }
+
+  function renderQueue() {
+    const q = state.queue;
+    if (!q) return;
+    const s = q.summary || {};
+    $("#queue-summary").innerHTML = [
+      `<span class="qs-chip qs-open"><b>${s.open ?? 0}</b> 未处理</span>`,
+      `<span class="qs-chip qs-resolved"><b>${s.resolved ?? 0}</b> 已处理</span>`,
+      `<span class="qs-chip qs-eliminated"><b>${s.eliminated ?? 0}</b> 已消除</span>`,
+    ].join("");
+    refreshFindingsBadge();
+
+    const list = $("#queue-list");
+    if (!q.items.length) {
+      list.innerHTML = `<div class="queue-empty">当前筛选条件下没有发现。<br/>未处理的审计异常会在此跨样本汇集。</div>`;
+      return;
+    }
+    list.innerHTML = q.items.map(renderQueueItem).join("");
+  }
+
+  function renderQueueItem(it) {
+    const timeWindow = it.time_from || it.time_to
+      ? `<div class="q-meta">异常时间边界：${esc(it.time_from || "—")} ~ ${esc(it.time_to || "开放")}</div>`
+      : "";
+    const custodians = (it.custodians || []).length
+      ? `<div class="q-meta">经手人：${it.custodians.map(esc).join("、")}（事件 #${(it.event_ids || []).join("、#")}）</div>`
+      : "";
+    let handler = "";
+    if (it.status === "resolved") {
+      handler = `<div class="q-handler">✔ 处置人：${esc(it.handler_name || "—")}
+        ${it.handler_note ? `｜备注：${esc(it.handler_note)}` : ""}
+        <div class="q-meta" style="margin:2px 0 0">处理时间：${esc(it.resolved_at || "")}</div></div>`;
+    } else if (it.status === "eliminated") {
+      handler = `<div class="q-handler">⌖ 已于 ${esc(it.eliminated_at || "")} 随链路重算消除（历史保留）
+        ${it.handler_name ? `<div class="q-meta" style="margin:2px 0 0">末处置人：${esc(it.handler_name)}${it.handler_note ? `｜${esc(it.handler_note)}` : ""}</div>` : ""}</div>`;
+    }
+
+    const formId = state.queueForm === it.fingerprint;
+    const action = it.status === "resolved" ? "reopen" : "resolve";
+    const form = formId
+      ? `<form class="q-dispose-form" data-fp="${it.fingerprint}" data-action="${action}" data-version="${it.version}">
+          <label>${action === "resolve" ? "处置人" : "重新打开人"}
+            <input type="text" class="qf-handler" maxlength="64" value="${esc(it.handler_name || "")}" placeholder="必填，如：审计员 王敏" required />
+          </label>
+          <label>备注
+            <input type="text" class="qf-note" maxlength="512" value="${esc(it.handler_note || "")}" placeholder="${action === "resolve" ? "处置措施 / 结论（可选）" : "重新打开原因（可选）"}" />
+          </label>
+          <div class="q-dispose-actions">
+            <button type="submit" class="btn btn-small btn-primary">${action === "resolve" ? "标记已处理" : "重新打开"}</button>
+            <button type="button" class="btn btn-small btn-ghost qf-cancel">取消</button>
+          </div>
+        </form>`
+      : "";
+
+    const actBtn = it.status === "open"
+      ? `<button class="link-btn btn-edit qf-act" data-fp="${it.fingerprint}">填写处置 / 标记已处理</button>`
+      : it.status === "resolved"
+      ? `<button class="link-btn btn-edit qf-act" data-fp="${it.fingerprint}">重新打开</button>`
+      : "";
+
+    return `
+    <div class="q-item q-${it.status}" data-fp="${it.fingerprint}">
+      <div class="q-item-head">
+        <span class="q-code-tag q-code-${it.code}">${esc(FINDING_LABEL[it.code] || it.code)}</span>
+        <span class="q-status q-${it.status}">${esc(QUEUE_STATUS_LABEL[it.status] || it.status)}</span>
+      </div>
+      <div class="q-sample" data-sample="${it.sample_id}">${esc(it.sample_code)} · ${esc(it.sample_name)}</div>
+      <div class="q-message">${esc(it.message)}</div>
+      ${custodians}
+      <div class="q-meta">发生时间：${esc(it.occurred_at || "—")}｜指纹 v${it.version}</div>
+      ${handler}
+      <div class="q-actions">
+        ${actBtn}
+        <button class="link-btn qf-transitions" data-fp="${it.fingerprint}">迁移记录</button>
+      </div>
+      ${form}
+    </div>`;
+  }
+
+  async function submitDisposition(formEl) {
+    const fp = formEl.dataset.fp;
+    const action = formEl.dataset.action;
+    const expectedVersion = Number(formEl.dataset.version);
+    const handlerName = formEl.querySelector(".qf-handler").value.trim();
+    const handlerNote = formEl.querySelector(".qf-note").value.trim();
+    if (!handlerName) {
+      toast("请填写处置人", true);
+      return;
+    }
+    const btn = formEl.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const resp = await fetch(`/api/findings/${fp}/disposition`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          handler_name: handlerName,
+          handler_note: handlerNote,
+          expected_version: expectedVersion,
+        }),
+      });
+      const payload = await resp.json().catch(() => null);
+      if (resp.status === 409) {
+        // 过期请求：指纹版本已变，按服务端最新视图刷新后提示重试
+        toast(payload?.detail || "处置冲突，队列已刷新，请重试", true);
+        state.queueForm = null;
+        await loadQueue();
+        return;
+      }
+      if (!resp.ok) throw new Error(extractError(payload) || `处置失败（${resp.status}）`);
+      // 处置成功：按当前筛选条件重新拉取（summary 同步角标），保留用户筛选视图
+      state.queueForm = null;
+      await loadQueue();
+      toast(action === "resolve" ? "已标记为已处理" : "已重新打开");
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  $("#queue-list").addEventListener("click", (e) => {
+    const sampleEl = e.target.closest(".q-sample");
+    if (sampleEl) {
+      switchSidebarTab("samples");
+      selectSample(Number(sampleEl.dataset.sample));
+      return;
+    }
+    const actBtn = e.target.closest(".qf-act");
+    if (actBtn) {
+      state.queueForm = state.queueForm === actBtn.dataset.fp ? null : actBtn.dataset.fp;
+      renderQueue();
+      const form = document.querySelector(`.q-dispose-form[data-fp="${state.queueForm}"]`);
+      if (form) form.querySelector(".qf-handler").focus();
+      return;
+    }
+    const cancelBtn = e.target.closest(".qf-cancel");
+    if (cancelBtn) {
+      state.queueForm = null;
+      renderQueue();
+      return;
+    }
+    const trBtn = e.target.closest(".qf-transitions");
+    if (trBtn) {
+      openTransitionsModal(trBtn.dataset.fp);
+    }
+  });
+
+  $("#queue-list").addEventListener("submit", (e) => {
+    const form = e.target.closest(".q-dispose-form");
+    if (form) {
+      e.preventDefault();
+      submitDisposition(form);
+    }
+  });
+
+  // 侧栏页签切换
+  function switchSidebarTab(tab) {
+    state.sidebarTab = tab;
+    $("#tab-samples").classList.toggle("active", tab === "samples");
+    $("#tab-findings").classList.toggle("active", tab === "findings");
+    $("#sidebar-samples").hidden = tab !== "samples";
+    $("#sidebar-findings").hidden = tab !== "findings";
+    $("#sidebar").classList.toggle("sidebar-wide", tab === "findings");
+    if (tab === "findings") loadQueue();
+  }
+
+  $("#tab-samples").addEventListener("click", () => switchSidebarTab("samples"));
+  $("#tab-findings").addEventListener("click", () => switchSidebarTab("findings"));
+  $("#btn-goto-queue").addEventListener("click", () => {
+    // 从样本详情跳入：仅按当前样本过滤，状态重置为未处理
+    state.queueSampleFilter = state.currentId;
+    $("#qf-status").value = "open";
+    $("#qf-code").value = "";
+    $("#qf-custodian").value = "";
+    $("#qf-from").value = "";
+    $("#qf-to").value = "";
+    switchSidebarTab("findings");
+  });
+
+  $("#btn-qf-apply").addEventListener("click", () => loadQueue());
+  $("#btn-qf-reset").addEventListener("click", () => {
+    state.queueSampleFilter = null;
+    $("#qf-status").value = "open";
+    $("#qf-code").value = "";
+    $("#qf-custodian").value = "";
+    $("#qf-from").value = "";
+    $("#qf-to").value = "";
+    loadQueue();
+  });
+
+  // 状态迁移记录弹窗
+  async function openTransitionsModal(fingerprint = null) {
+    let url = "/api/findings/transitions?limit=200";
+    if (fingerprint) url += `&fingerprint=${encodeURIComponent(fingerprint)}`;
+    $("#transitions-title").textContent = fingerprint
+      ? "状态迁移记录（当前发现）"
+      : "状态迁移记录（全部样本，最新 200 条）";
+    try {
+      const data = await api(url);
+      $("#transitions-tbody").innerHTML = data.items.length
+        ? data.items
+            .map(
+              (t) => `
+          <tr>
+            <td class="muted-cell">${esc(t.created_at)}</td>
+            <td>${t.sample_code ? esc(t.sample_code) : `<span class="muted-cell">#${t.sample_id}（已删除）</span>`}</td>
+            <td><span class="q-code-tag q-code-${esc(t.finding_code || "")}">${esc(t.finding_code_text)}</span></td>
+            <td>${esc(t.from_status_text)} → <b>${esc(t.to_status_text)}</b><div class="muted-cell">${esc(t.action_text)}</div></td>
+            <td>${esc(t.actor)}</td>
+            <td>${t.note ? esc(t.note) : `<span class="muted-cell">${esc(t.finding_message || "—")}</span>`}</td>
+          </tr>`
+            )
+            .join("")
+        : `<tr><td colspan="6" class="muted-cell" style="text-align:center;padding:20px">暂无迁移记录</td></tr>`;
+      $("#transitions-modal").hidden = false;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  $("#btn-qf-transitions").addEventListener("click", () => openTransitionsModal());
+  const transitionsModal = $("#transitions-modal");
+  $("#btn-close-transitions").addEventListener("click", () => (transitionsModal.hidden = true));
+  transitionsModal.addEventListener("click", (e) => {
+    if (e.target === transitionsModal) transitionsModal.hidden = true;
+  });
 
   // ---------- 样本新建 / 删除 ----------
 
@@ -1114,6 +1403,7 @@
   (async function init() {
     try {
       await loadSamples();
+      await refreshFindingsBadge();
       if (state.samples.length) await selectSample(state.samples[0].id);
       else showEmpty();
     } catch (err) {
